@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nearby Mosques</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+:root{--bg:#f2f5ef;--panel:#fff;--ink:#17221d;--mute:#5d6b63;--green:#0e4d3a;--brass:#b3862a;--line:#dde4da}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1713;--panel:#17221d;--ink:#eaf0ea;--mute:#98a89e;--green:#58c29b;--brass:#e0b350;--line:#26352d}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:Figtree,system-ui,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0)}
+#map{flex:0 0 42vh;min-height:220px}
+#sheet{flex:1;overflow-y:auto;background:var(--panel);border-radius:18px 18px 0 0;margin-top:-16px;position:relative;z-index:500;padding:16px 16px calc(16px + env(safe-area-inset-bottom,0))}
+.next{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.next b{font-size:1.5rem;color:var(--green)}
+.next span{color:var(--mute);font-size:.9rem}
+.times{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin:12px 0}
+.t{text-align:center;padding:8px 2px;border-radius:10px;background:var(--bg);font-size:.78rem;color:var(--mute)}
+.t strong{display:block;font-size:.95rem;color:var(--ink)}
+.t.on{background:var(--green);color:#fff}.t.on strong{color:#fff}
+.mode{display:flex;gap:8px;margin:4px 0 10px}
+.mode button{flex:1;padding:9px;border-radius:10px;border:1px solid var(--line);background:none;color:var(--ink);font:inherit}
+.mode button.on{border-color:var(--green);background:var(--green);color:#fff}
+.m{display:flex;justify-content:space-between;gap:10px;padding:12px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.m.sel{border-left:4px solid var(--brass);padding-left:10px}
+.m h3{margin:0;font-size:1rem}
+.m p{margin:2px 0 0;color:var(--mute);font-size:.85rem}
+.m .d{text-align:right;white-space:nowrap}
+.m .d b{display:block}
+#status{color:var(--mute);font-size:.85rem;padding:6px 0}
+.note{font-size:.75rem;color:var(--mute);margin-top:12px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="sheet">
+  <div class="next"><b id="nextName">Prayer times</b><span id="nextIn">Waiting for location…</span></div>
+  <div class="times" id="times"></div>
+  <div class="mode"><button id="bWalk" class="on">Walk</button><button id="bCar">Drive</button></div>
+  <div id="status">Allow location access to find mosques near you.</div>
+  <div id="list"></div>
+  <p class="note">Prayer times are calculated for your location (Karachi method, Hanafi Asr). Mosques are listed from OpenStreetMap; individual jamaat times are not available there, so confirm locally.</p>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const map=L.map('map',{zoomControl:false}).setView([24.86,67.0],14);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+let me=null,meMarker=null,lastQ=null,mosques=[],sel=null,mode='foot',routeLine=null,markers={},prayer=null,lastRoute=0;
+const mosqueIcon=L.divIcon({html:'<div style="width:14px;height:14px;border-radius:50%;background:#b3862a;border:2px solid #fff"></div>',className:'',iconSize:[14,14]});
+const meIcon=L.divIcon({html:'<div style="width:16px;height:16px;border-radius:50%;background:#0e6bd8;border:3px solid #fff;box-shadow:0 0 0 6px rgba(14,107,216,.25)"></div>',className:'',iconSize:[16,16]});
+
+function dist(a,b,c,d){const R=6371000,r=Math.PI/180,x=(c-a)*r,y=(d-b)*r;
+ const h=Math.sin(x/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin(y/2)**2;return 2*R*Math.asin(Math.sqrt(h));}
+const fmtD=m=>m<1000?Math.round(m)+' m':(m/1000).toFixed(1)+' km';
+const fmtT=s=>{const m=Math.max(1,Math.round(s/60));return m<60?m+' min':Math.floor(m/60)+' h '+m%60+' min'};
+
+function onPos(p){
+  me={lat:p.coords.latitude,lon:p.coords.longitude};
+  if(!meMarker){meMarker=L.marker([me.lat,me.lon],{icon:meIcon}).addTo(map);map.setView([me.lat,me.lon],16);}
+  else meMarker.setLatLng([me.lat,me.lon]);
+  if(!lastQ||dist(me.lat,me.lon,lastQ.lat,lastQ.lon)>300){lastQ={...me};loadMosques();loadPrayer();}
+  else{rank();}
+  if(sel&&Date.now()-lastRoute>15000)route();
+}
+function onErr(e){$('status').textContent=e.code===1?'Location is blocked. Enable it in your browser settings and reload.':'Could not get your location. Open this page over https and try again.';}
+if(navigator.geolocation)navigator.geolocation.watchPosition(onPos,onErr,{enableHighAccuracy:true,maximumAge:5000,timeout:20000});
+else $('status').textContent='This browser does not support location.';
+
+async function loadMosques(r=2000){
+  $('status').textContent='Finding mosques…';
+  const q=`[out:json][timeout:25];(node["amenity"="place_of_worship"]["religion"="muslim"](around:${r},${me.lat},${me.lon});way["amenity"="place_of_worship"]["religion"="muslim"](around:${r},${me.lat},${me.lon}););out center tags 60;`;
+  try{
+    const res=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:'data='+encodeURIComponent(q)});
+    const j=await res.json();
+    mosques=j.elements.map(e=>({id:e.type+e.id,name:e.tags.name||e.tags['name:en']||'Mosque (unnamed)',lat:e.lat||e.center.lat,lon:e.lon||e.center.lon})).filter(m=>m.lat);
+    if(!mosques.length&&r<8000)return loadMosques(r*2);
+    Object.values(markers).forEach(m=>m.remove());markers={};
+    mosques.forEach(m=>{markers[m.id]=L.marker([m.lat,m.lon],{icon:mosqueIcon}).addTo(map).on('click',()=>pick(m.id));});
+    sel=null;rank();pick(sorted()[0]?.id);
+  }catch(e){$('status').textContent='Could not load mosques. Check your connection and try again.';}
+}
+const sorted=()=>mosques.map(m=>({...m,d:dist(me.lat,me.lon,m.lat,m.lon)})).sort((a,b)=>a.d-b.d);
+function rank(){
+  const s=sorted();
+  $('status').textContent=s.length?s.length+' mosques nearby, closest first':'No mosques found within 8 km.';
+  $('list').innerHTML=s.slice(0,15).map(m=>{
+    const est=m.d*1.3/(mode==='foot'?80:500)*60;
+    const eta=sel&&sel.id===m.id&&sel.eta?sel.eta:fmtT(est);
+    return `<div class="m ${sel&&sel.id===m.id?'sel':''}" data-id="${m.id}"><div><h3>${m.name.replace(/</g,'&lt;')}</h3><p>${mode==='foot'?'Walking':'Driving'}</p></div><div class="d"><b>${fmtD(m.d)}</b><span style="color:var(--mute);font-size:.85rem">${eta}</span></div></div>`}).join('');
+  document.querySelectorAll('.m').forEach(el=>el.onclick=()=>pick(el.dataset.id));
+}
+function pick(id){const m=mosques.find(x=>x.id===id);if(!m)return;sel={...m};route();}
+async function route(){
+  if(!sel||!me)return;lastRoute=Date.now();
+  const prof=mode==='foot'?'routed-foot':'routed-car';
+  try{
+    const u=`https://routing.openstreetmap.de/${prof}/route/v1/driving/${me.lon},${me.lat};${sel.lon},${sel.lat}?overview=full&geometries=geojson`;
+    const j=await (await fetch(u)).json();const r=j.routes[0];
+    if(routeLine)routeLine.remove();
+    routeLine=L.geoJSON(r.geometry,{style:{color:'#0e4d3a',weight:5,opacity:.85}}).addTo(map);
+    map.fitBounds(routeLine.getBounds(),{padding:[40,40],maxZoom:17});
+    sel.eta=fmtT(r.duration)+' · '+fmtD(r.distance);
+  }catch(e){}
+  rank();
+}
+$('bWalk').onclick=()=>{mode='foot';$('bWalk').classList.add('on');$('bCar').classList.remove('on');route();};
+$('bCar').onclick=()=>{mode='car';$('bCar').classList.add('on');$('bWalk').classList.remove('on');route();};
+
+async function loadPrayer(){
+  const d=new Date(),ds=`${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}-${d.getFullYear()}`;
+  try{
+    const j=await (await fetch(`https://api.aladhan.com/v1/timings/${ds}?latitude=${me.lat}&longitude=${me.lon}&method=1&school=1`)).json();
+    const t=j.data.timings;prayer=['Fajr','Dhuhr','Asr','Maghrib','Isha'].map(n=>({n,t:t[n].slice(0,5)}));
+    tick();
+  }catch(e){$('nextIn').textContent='Prayer times unavailable';}
+}
+function tick(){
+  if(!prayer)return;const now=new Date();let nxt=null;
+  const at=p=>{const[h,m]=p.t.split(':');const x=new Date();x.setHours(+h,+m,0,0);return x};
+  for(const p of prayer){if(at(p)>now){nxt=p;break;}}
+  let when;
+  if(nxt)when=at(nxt);else{nxt=prayer[0];when=at(nxt);when.setDate(when.getDate()+1);}
+  const mins=Math.round((when-now)/60000);
+  $('nextName').textContent=nxt.n+' '+nxt.t;
+  $('nextIn').textContent='in '+(mins>=60?Math.floor(mins/60)+' h '+mins%60+' min':mins+' min');
+  $('times').innerHTML=prayer.map(p=>`<div class="t ${p===nxt?'on':''}">${p.n}<strong>${p.t}</strong></div>`).join('');
+}
+setInterval(tick,30000);
+</script>
+</body>
+</html>
